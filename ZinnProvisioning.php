@@ -53,6 +53,21 @@ class ZinnProvisioning
     public const TIMEOUT = 20;
 
     /**
+     * Seconds to wait on a call that carries an `Idempotency-Key`.
+     *
+     * ⛔⛔ IT MUST EXCEED THE PLATFORM'S IN-FLIGHT LOCK, AND 20 DID NOT (D18631, measured in
+     * WHMCS 9.0.7 against production on 2026-09-02 — the same client code, one panel over).
+     * `IdempotentCreateMixin.replay` reserves the key for **30 seconds** and answers a repeat
+     * inside that window with `409 ... already in progress`, so a client that gives up at 20s
+     * discards the answer carrying the new site's id AND cannot retry to recover it. The site
+     * exists, the panel records nothing, and the account looks like a failed order.
+     *
+     * ⛔ Only keyed calls get the longer wait: a read that hangs should fail fast, and a keyed
+     * write is safe to wait on precisely because a duplicate cannot be created.
+     */
+    public const PROVISION_TIMEOUT = 60;
+
+    /**
      * API base URL.
      *
      * @var string
@@ -169,10 +184,13 @@ class ZinnProvisioning
      * @param string $orgId            The organisation id from `account()`.
      * @param string $domain           The hostname the customer bought.
      * @param string $productLine      The Zinn product line, e.g. `mainstream`.
-     * @param string $stackType        What to build: one of `headless_cms`, `node`,
-     *                                 `nextcloud`, `node`, `one_click`, `owncloud`, `php`, `static`,
-     *                                 `woocommerce`, `wordpress`.
-     * @param string $application      For `one_click`/`headless_cms` only. Empty to omit.
+     * @param string $stackType        What to build: one of `dotnet`, `headless_cms`,
+     *                                 `nextcloud`, `node`, `one_click`, `owncloud`, `php`,
+     *                                 `php_app`, `python`, `ruby`, `static`, `woocommerce`,
+     *                                 `wordpress`.
+     * @param string $application      For `one_click`/`headless_cms`/`php_app` only. Empty to
+     *                                 omit. For `php_app` it names the application to install,
+     *                                 e.g. `joomla`.
      * @param string $phpVersion       e.g. `8.3`. Empty for the product line's default.
      * @param string $subscriptionId   REQUIRED — the id from `plan()`. See below.
      * @return string The Zinn site id. Store it against your service.
@@ -367,6 +385,75 @@ class ZinnProvisioning
      * @param string $idempotencyKey Idempotency key, or an empty string.
      * @return array<int,string>
      */
+
+    /**
+     * The `Idempotency-Key` a request actually carries.
+     *
+     * ⛔⛔ THE CALLER'S KEY NAMES THE OPERATION; THE BODY HASH SAYS WHICH ONE (D18635).
+     * The module's keys are stable per service (`whmcs-site-42`), per client (`whmcs-org-7`)
+     * and per plan — which is right for a retry and wrong for everything else, because the
+     * platform fingerprints the BODY and answers a key reused with a different one:
+     *
+     *     {"result":"error","message":"Idempotency-Key reused with a different request body."}
+     *
+     * Measured inside WHMCS 9.0.7 on 2026-09-02: terminate a service, re-order it on a new
+     * domain, and the create is refused — for the full 24-hour replay window, on the one
+     * button that sells anything. The same trap fires when a client's company name is edited
+     * (the org body changes) or a product's billing interval is switched.
+     *
+     * ⭐ Hashing the body REMOVES the class rather than patching three call sites, and it
+     * keeps the property the keys exist for: a genuine retry sends the same bytes, so it
+     * still replays; a different request is a different operation and is allowed to proceed.
+     * Fixing the three call sites individually would have been an enumeration of the cases
+     * somebody thought of (§2.24).
+     *
+     * @param string                   $logicalKey The caller's key, or an empty string.
+     * @param array<string,mixed>|null $body       The JSON body, or null.
+     * @return string
+     */
+
+    /**
+     * The bytes a JSON body is sent as.
+     *
+     * ⛔⛔ AN EMPTY PHP ARRAY IS A JSON **LIST**, AND THE PLATFORM REFUSES ONE (D18636).
+     * `json_encode([])` is `[]`, not `{}`, so every call this module makes with no fields —
+     * unsuspend, single sign-on, take backup, purge cache — sent a list where an object was
+     * required and came back:
+     *
+     *     422 non_field_errors: Invalid data. Expected a dictionary, but got list.
+     *
+     * Measured through a real WHMCS on 2026-09-02: **Purge Cache had never worked**, from the
+     * admin page or the client area, and neither had the other three. It is D17360's shape
+     * exactly — a body the platform will not accept — and it survived because the suite
+     * asserts the body as a PHP array, where `[]` and "an empty object" are the same value.
+     * Only the wire tells them apart.
+     *
+     * ⭐ Fixed here rather than at the four call sites, and the difference matters: passing
+     * `new stdClass()` at each one is an enumeration of the calls somebody remembered, and the
+     * fifth would be wrong again (§2.24).
+     *
+     * @param array<string,mixed>|null $body The JSON body, or null for none.
+     * @return string|null
+     */
+    public static function encodeBody(?array $body): ?string
+    {
+        if ($body === null) {
+            return null;
+        }
+        // An empty array is the only ambiguous case: PHP cannot tell "no fields" from
+        // "an empty list", and JSON must.
+        return $body === [] ? '{}' : json_encode($body, JSON_THROW_ON_ERROR);
+    }
+
+    public static function idempotencyKeyFor(string $logicalKey, ?array $body): string
+    {
+        if ($logicalKey === '') {
+            return '';
+        }
+        $encoded = $body === null ? '' : (string) json_encode($body);
+        return $logicalKey . '-' . substr(sha1($encoded), 0, 10);
+    }
+
     public function headers(bool $hasBody, string $idempotencyKey): array
     {
         $headers = [
@@ -401,7 +488,18 @@ class ZinnProvisioning
             $message = (string) $decoded['error']['message'];
         }
         if ($message === '') {
-            $message = 'The hosting platform answered with status ' . $status . '.';
+            // ⛔⛔ A 5xx IS OUR FAULT AND THE OLD SENTENCE READ LIKE THE RESELLER'S (D18637).
+            // "The hosting platform answered with status 500." names no cause and no next
+            // step, so a reseller re-checks their key, their product and their plan — none of
+            // which is wrong. Measured on 2026-09-02: three buttons answered 500 on a site
+            // whose vendor account was missing, and the platform's own log carried a perfect
+            // sentence saying exactly that, which the response body did not.
+            $message = $status >= 500
+                ? 'The hosting platform had a fault of its own (HTTP ' . $status . '), so '
+                    . 'nothing here is wrong with your settings. It is safe to try again in a '
+                    . 'few minutes; if it keeps happening, send Zinn support this service and '
+                    . 'the time you pressed it.'
+                : 'The hosting platform answered with status ' . $status . '.';
         }
         // ⛔⛔ THE `details` ARRAY IS THE HALF THAT SAYS WHAT TO DO, AND IT USED TO BE
         // DISCARDED. A validation failure's top-level message is deliberately generic —
@@ -410,7 +508,18 @@ class ZinnProvisioning
         // reseller's admin staring at a sentence that names nothing, on the one screen
         // where they are trying to work out what to change (D17362).
         $message .= self::detailSuffix($decoded);
-        throw new RuntimeException($message);
+        // ⛔⛔ THE STATUS TRAVELS WITH THE MESSAGE, AND WITHOUT IT A TERMINATION DELETED
+        // NOTHING (D18633). A caller that has to decide *"is this gone, or did I fail to
+        // ask?"* cannot read a sentence — and reading every failure as "gone" is the
+        // reassuring direction (§2.44). Measured live: a transient `502` on the pre-delete
+        // lookup made WHMCS mark a service Terminated while the site kept running and the
+        // reseller kept being invoiced for it.
+        //
+        // ⭐ Carried as the exception CODE rather than a new exception class: every existing
+        // `catch (RuntimeException)` and every message assertion is unchanged, and a caller
+        // that does not care never sees it. A transport failure keeps code 0 — deliberately
+        // NOT a status, because "we never got an answer" is a different fact from any status.
+        throw new RuntimeException($message, $status);
     }
 
     /**
@@ -469,18 +578,19 @@ class ZinnProvisioning
      */
     private function request(string $method, string $path, ?array $body, string $idempotencyKey): array
     {
+        $idempotencyKey = self::idempotencyKeyFor($idempotencyKey, $body);
         $ch = curl_init($this->base . $path);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_HTTPHEADER => $this->headers($body !== null, $idempotencyKey),
-            CURLOPT_TIMEOUT => self::TIMEOUT,
+            CURLOPT_TIMEOUT => $idempotencyKey === '' ? self::TIMEOUT : self::PROVISION_TIMEOUT,
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
         ]);
         if ($body !== null) {
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_THROW_ON_ERROR));
+            curl_setopt($ch, CURLOPT_POSTFIELDS, self::encodeBody($body));
         }
         $raw = curl_exec($ch);
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -488,6 +598,17 @@ class ZinnProvisioning
         curl_close($ch);
 
         if ($raw === false) {
+            // ⛔⛔ A KEYED WRITE THAT DID NOT ANSWER IS NOT A WRITE THAT DID NOT HAPPEN
+            // (D18631). "Could not reach" reads as *nothing happened*, and the reseller's
+            // natural response to that is to cancel an order whose hosting is already live.
+            if ($idempotencyKey !== '') {
+                throw new RuntimeException(
+                    'The hosting platform did not answer in time (' . $transportError . '). '
+                    . 'The operation may still have completed — wait a minute and press the '
+                    . 'same button again. It carries an idempotency key, so a repeat returns '
+                    . 'the same account rather than creating a second one.'
+                );
+            }
             throw new RuntimeException('Could not reach the hosting platform: ' . $transportError);
         }
         return $this->interpret($status, (string) $raw);
