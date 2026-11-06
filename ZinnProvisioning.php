@@ -253,7 +253,10 @@ class ZinnProvisioning
      *
      * @param string $siteId Zinn site id.
      * @param string $reason Your own note, typically the unpaid invoice number.
-     * @return array<string,mixed> The service row, now suspended.
+     * The answer is `202`: the hold is applied on the site's server within a few minutes.
+     * Until then `serving_change` on the row shows it (`status` still reads `active`).
+     *
+     * @return array<string,mixed> The service row, with the hold being applied.
      */
     public function suspend(string $siteId, string $reason = ''): array
     {
@@ -270,7 +273,10 @@ class ZinnProvisioning
      * billing system may release that. Show the message; do not retry it.
      *
      * @param string $siteId Zinn site id.
-     * @return array<string,mixed> The service row, serving again.
+     * The answer is `202`: the release is applied on the server within a few minutes, and
+     * `serving_change` on the row shows it until then.
+     *
+     * @return array<string,mixed> The service row, with the release being applied.
      */
     public function unsuspend(string $siteId): array
     {
@@ -579,6 +585,7 @@ class ZinnProvisioning
     private function request(string $method, string $path, ?array $body, string $idempotencyKey): array
     {
         $idempotencyKey = self::idempotencyKeyFor($idempotencyKey, $body);
+        self::requireCurl();
         $ch = curl_init($this->base . $path);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
@@ -592,7 +599,7 @@ class ZinnProvisioning
         if ($body !== null) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, self::encodeBody($body));
         }
-        $raw = curl_exec($ch);
+        $raw = curl_exec($ch); // php-fn-guard-ok: requireCurl() above refuses unless canCall('curl_exec').
         $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         $transportError = curl_error($ch);
         curl_close($ch);
@@ -612,5 +619,43 @@ class ZinnProvisioning
             throw new RuntimeException('Could not reach the hosting platform: ' . $transportError);
         }
         return $this->interpret($status, (string) $raw);
+    }
+
+    /**
+     * Whether this server's PHP lets us call `$fn`: it exists AND it is not in the host's
+     * `disable_functions`.
+     *
+     * ⛔⛔ On PHP 8 a disabled function is UNDEFINED, so calling it is a fatal error that `@`
+     * does not stop (V1 ticket 13692, docs/72 D35246). A billing panel on a hardened host
+     * would show the admin a blank page instead of a reason. PHP 7 keeps a disabled function
+     * "existing", which is why the list is read as well.
+     *
+     * @param string $fn Function name.
+     * @return bool
+     */
+    private static function canCall(string $fn): bool
+    {
+        if (!function_exists($fn)) {
+            return false;
+        }
+        $off = array_map('trim', explode(',', strtolower((string) ini_get('disable_functions'))));
+        return !in_array(strtolower($fn), $off, true);
+    }
+
+    /**
+     * Refuse, with the reason, when this server cannot make an HTTPS call at all. Nothing was
+     * sent, so it is safe to fix the host and press the same button again.
+     *
+     * @return void
+     */
+    private static function requireCurl(): void
+    {
+        if (!self::canCall('curl_init') || !self::canCall('curl_exec')) {
+            throw new RuntimeException(
+                'This server\'s PHP cannot make HTTPS calls: the curl extension is missing or '
+                . 'curl_init/curl_exec is listed in disable_functions, so the request was not sent. '
+                . 'Ask your host to enable curl, then press the same button again.'
+            );
+        }
     }
 }
